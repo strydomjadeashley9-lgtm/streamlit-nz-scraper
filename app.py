@@ -1,4 +1,4 @@
-# app.py — NZ Job Scraper for Clients (Seek-only)
+# app.py — NZ Job Scraper for Clients (Seek-only) with Occupation from Airtable
 
 import os
 from datetime import datetime
@@ -8,66 +8,60 @@ import requests
 import pandas as pd
 import streamlit as st
 
-# Uses the scraper you already added in your repo:
-# csv_scraper/scraper_serp.py must define scrape_serp_jobs(query, location, num_pages)
+# Your existing SERP scraper
 from csv_scraper.scraper_serp import scrape_serp_jobs
 
-# ---------------- Page setup ----------------
 st.set_page_config(page_title="NZ Job Scraper for Clients", page_icon="🧑‍💼", layout="wide")
 st.markdown("## 🧑‍💼 NZ Job Scraper for Clients")
 
 # ---------------- Secrets helpers ----------------
 def get_secret(name: str, default: str | None = None) -> str | None:
-    """Prefer Streamlit secrets; fallback to env vars."""
     return str(st.secrets.get(name, os.getenv(name, default)) or "")
 
-GOOGLE_API_KEY         = get_secret("GOOGLE_API_KEY")         # SerpAPI key
+GOOGLE_API_KEY         = get_secret("GOOGLE_API_KEY")
 AIRTABLE_API_KEY       = get_secret("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID       = get_secret("AIRTABLE_BASE_ID")
 AIRTABLE_CLIENTS_TABLE = get_secret("AIRTABLE_CLIENTS_TABLE", "Job Seekers")
 AIRTABLE_VIEW          = get_secret("AIRTABLE_VIEW", "Grid view")
-AIRTABLE_CLIENT_FIELD  = get_secret("AIRTABLE_CLIENT_FIELD", "Full Name")
+AIRTABLE_CLIENT_FIELD  = get_secret("AIRTABLE_CLIENT_FIELD", "Full Name")   # name column
+AIRTABLE_CLIENT_PROF   = get_secret("AIRTABLE_CLIENT_PROF_FIELD", "Profession")  # occupation column
 
-# Tiny debug line so you can verify the source at a glance (safe to keep)
-st.caption(f"Clients from Airtable → **{AIRTABLE_CLIENTS_TABLE} / {AIRTABLE_VIEW} / {AIRTABLE_CLIENT_FIELD}**")
+st.caption(
+    f"Clients from Airtable → **{AIRTABLE_CLIENTS_TABLE} / {AIRTABLE_VIEW} / "
+    f"{AIRTABLE_CLIENT_FIELD} + {AIRTABLE_CLIENT_PROF}**"
+)
 
-# ---------------- Airtable fetch ----------------
-def fetch_airtable_clients() -> list[str]:
-    """Fetch client names from Airtable `Job Seekers` table using the `Full Name` field."""
+# ---------------- Airtable fetch (name + profession) ----------------
+def fetch_airtable_clients() -> list[dict]:
     if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_CLIENTS_TABLE):
         return []
-
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_CLIENTS_TABLE)}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    params = {}
-    if AIRTABLE_VIEW:
-        params["view"] = AIRTABLE_VIEW
+    params = {"view": AIRTABLE_VIEW} if AIRTABLE_VIEW else {}
 
-    names, offset = [], None
+    rows, offset = [], None
     while True:
         if offset:
             params["offset"] = offset
         r = requests.get(url, headers=headers, params=params, timeout=30)
         r.raise_for_status()
-        data = r.json()
-
-        for rec in data.get("records", []):
+        payload = r.json()
+        for rec in payload.get("records", []):
             f = rec.get("fields", {})
-            # Use the exact field from Secrets, default "Full Name"
-            name = f.get(AIRTABLE_CLIENT_FIELD)
-            if isinstance(name, str) and name.strip():
-                names.append(name.strip())
-
-        offset = data.get("offset")
+            name = (f.get(AIRTABLE_CLIENT_FIELD) or "").strip()
+            prof = (f.get(AIRTABLE_CLIENT_PROF) or "").strip()
+            if name:
+                rows.append({"name": name, "profession": prof})
+        offset = payload.get("offset")
         if not offset:
             break
 
-    # De-dupe (keep order)
-    seen, ordered = set(), []
-    for n in names:
-        if n not in seen:
-            seen.add(n); ordered.append(n)
-    return ordered
+    # de-dupe by name, keep first profession seen
+    seen, out = set(), []
+    for row in rows:
+        if row["name"] not in seen:
+            seen.add(row["name"]); out.append(row)
+    return out
 
 # ---------------- Seek-only helpers ----------------
 SEEK_DOMAINS = ["seek.co.nz", "seek.com", "seek.com.au", "nz.seek.co.nz"]
@@ -87,20 +81,29 @@ def normalize_filename(s: str) -> str:
 colA, colB = st.columns([1, 2])
 
 with colA:
+    clients = []
     try:
         clients = fetch_airtable_clients()
     except Exception as e:
-        st.error(f"Error fetching clients from Airtable: {e}")
-        clients = []
+        st.error(f"Airtable error: {e}")
 
-    client = (
-        st.selectbox("Choose a client", clients)
-        if clients else
-        st.text_input("Client name", placeholder="Type a name…")
+    names = [c["name"] for c in clients]
+    selected_name = (
+        st.selectbox("Choose a client", names, index=0) if names
+        else st.text_input("Client name", placeholder="Type a name…")
     )
 
+    # Find selected client details
+    selected = next((c for c in clients if c["name"] == selected_name), None) if names else None
+    occupation = (selected or {}).get("profession", "").strip()
+
 with colB:
-    query = st.text_input("Job Search Query", value="Teacher jobs new zealand")
+    default_query = f"{occupation} jobs new zealand" if occupation else "Teacher jobs new zealand"
+    query = st.text_input("Job Search Query", value=default_query)
+
+# Show occupation under the dropdown
+if occupation:
+    st.markdown(f"**Occupation:** {occupation}")
 
 st.markdown("### Job board")
 st.checkbox("Seek", value=True, disabled=True, help="Only Seek is enabled.")
@@ -108,37 +111,40 @@ run = st.button("🔍 Run Scraper", type="primary")
 
 # ---------------- Run ----------------
 if run:
-    # Basic validations
-    if not client.strip():
-        st.error("Please choose or enter a client name.")
-        st.stop()
+    client_name = selected_name if names else selected_name
+    if not client_name.strip():
+        st.error("Please choose or enter a client name."); st.stop()
     if not query.strip():
-        st.error("Please enter a search query.")
-        st.stop()
+        st.error("Please enter a search query."); st.stop()
     if not GOOGLE_API_KEY:
-        st.error("Missing GOOGLE_API_KEY in Secrets.")
-        st.stop()
+        st.error("Missing GOOGLE_API_KEY in Secrets."); st.stop()
 
     with st.status("🔎 Searching Seek via Google Jobs (SerpAPI)…", expanded=True) as status:
-        st.write(f"Client: **{client}**")
+        st.write(f"Client: **{client_name}**")
+        if occupation:
+            st.write(f"Occupation: **{occupation}**")
         st.write(f"Query: **{query}**")
 
-        # Use your existing scraper; get more pages by raising num_pages
         raw_jobs = scrape_serp_jobs(query, location="New Zealand", num_pages=3)
         seek_jobs = [j for j in raw_jobs if is_seek_link(j.get("Application Weblink", ""))]
 
-        st.write(f"Fetched {len(raw_jobs)} jobs; {len(seek_jobs)} are from Seek.")
+        st.write(f"Fetched {len(raw_jobs)} jobs; {len(seek_jobs)} from Seek.")
         status.update(label="✨ Finished search", state="complete")
 
     df = pd.DataFrame(seek_jobs)
     if df.empty:
         st.warning("No Seek jobs found for this query.")
     else:
+        # Annotate with client & occupation for the CSV
+        df.insert(0, "Client", client_name)
+        if occupation:
+            df.insert(1, "Occupation", occupation)
+
         st.success(f"Found {len(df):,} Seek jobs.")
         st.dataframe(df, use_container_width=True)
 
         ts = datetime.now().strftime("%Y%m%d-%H%M")
-        fname = f"{normalize_filename(client)}_{normalize_filename(query)}_{ts}_SEEK.csv"
+        fname = f"{normalize_filename(client_name)}_{normalize_filename(query)}_{ts}_SEEK.csv"
         st.download_button(
             "⬇️ Download CSV",
             df.to_csv(index=False).encode("utf-8-sig"),
@@ -147,4 +153,4 @@ if run:
         )
 
 st.markdown("---")
-st.caption("Client list comes from Airtable. Jobs are filtered to Seek only.")
+st.caption("Client & Occupation pulled from Airtable. Jobs filtered to Seek only.")

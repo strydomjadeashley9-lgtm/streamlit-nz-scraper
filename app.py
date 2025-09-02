@@ -8,7 +8,6 @@ import requests
 import pandas as pd
 import streamlit as st
 
-# Your existing SERP scraper
 from csv_scraper.scraper_serp import scrape_serp_jobs
 
 st.set_page_config(page_title="NZ Job Scraper for Clients", page_icon="🧑‍💼", layout="wide")
@@ -18,13 +17,15 @@ st.markdown("## 🧑‍💼 NZ Job Scraper for Clients")
 def get_secret(name: str, default: str | None = None) -> str | None:
     return str(st.secrets.get(name, os.getenv(name, default)) or "")
 
-GOOGLE_API_KEY         = get_secret("GOOGLE_API_KEY")
+# SerpAPI key (either name is fine)
+SERPAPI_KEY            = get_secret("SERPAPI_KEY") or get_secret("GOOGLE_API_KEY")
+
 AIRTABLE_API_KEY       = get_secret("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID       = get_secret("AIRTABLE_BASE_ID")
 AIRTABLE_CLIENTS_TABLE = get_secret("AIRTABLE_CLIENTS_TABLE", "Job Seekers")
 AIRTABLE_VIEW          = get_secret("AIRTABLE_VIEW", "Grid view")
-AIRTABLE_CLIENT_FIELD  = get_secret("AIRTABLE_CLIENT_FIELD", "Full Name")   # name column
-AIRTABLE_CLIENT_PROF   = get_secret("AIRTABLE_CLIENT_PROF_FIELD", "Profession")  # occupation column
+AIRTABLE_CLIENT_FIELD  = get_secret("AIRTABLE_CLIENT_FIELD", "Full Name")
+AIRTABLE_CLIENT_PROF   = get_secret("AIRTABLE_CLIENT_PROF_FIELD", "Profession")
 
 st.caption(
     f"Clients from Airtable → **{AIRTABLE_CLIENTS_TABLE} / {AIRTABLE_VIEW} / "
@@ -56,7 +57,6 @@ def fetch_airtable_clients() -> list[dict]:
         if not offset:
             break
 
-    # de-dupe by name, keep first profession seen
     seen, out = set(), []
     for row in rows:
         if row["name"] not in seen:
@@ -92,8 +92,6 @@ with colA:
         st.selectbox("Choose a client", names, index=0) if names
         else st.text_input("Client name", placeholder="Type a name…")
     )
-
-    # Find selected client details
     selected = next((c for c in clients if c["name"] == selected_name), None) if names else None
     occupation = (selected or {}).get("profession", "").strip()
 
@@ -101,7 +99,6 @@ with colB:
     default_query = f"{occupation} jobs new zealand" if occupation else "Teacher jobs new zealand"
     query = st.text_input("Job Search Query", value=default_query)
 
-# Show occupation under the dropdown
 if occupation:
     st.markdown(f"**Occupation:** {occupation}")
 
@@ -111,13 +108,13 @@ run = st.button("🔍 Run Scraper", type="primary")
 
 # ---------------- Run ----------------
 if run:
-    client_name = selected_name if names else selected_name
+    client_name = selected_name
     if not client_name.strip():
         st.error("Please choose or enter a client name."); st.stop()
     if not query.strip():
         st.error("Please enter a search query."); st.stop()
-    if not GOOGLE_API_KEY:
-        st.error("Missing GOOGLE_API_KEY in Secrets."); st.stop()
+    if not SERPAPI_KEY:
+        st.error("Missing SERPAPI_KEY (or GOOGLE_API_KEY) in Secrets."); st.stop()
 
     with st.status("🔎 Searching Seek via Google Jobs (SerpAPI)…", expanded=True) as status:
         st.write(f"Client: **{client_name}**")
@@ -125,7 +122,12 @@ if run:
             st.write(f"Occupation: **{occupation}**")
         st.write(f"Query: **{query}**")
 
-        raw_jobs = scrape_serp_jobs(query, location="New Zealand", num_pages=3)
+        try:
+            raw_jobs = scrape_serp_jobs(query, location="New Zealand", num_pages=3, api_key=SERPAPI_KEY)
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            st.stop()
+
         seek_jobs = [j for j in raw_jobs if is_seek_link(j.get("Application Weblink", ""))]
 
         st.write(f"Fetched {len(raw_jobs)} jobs; {len(seek_jobs)} from Seek.")
@@ -135,7 +137,6 @@ if run:
     if df.empty:
         st.warning("No Seek jobs found for this query.")
     else:
-        # Annotate with client & occupation for the CSV
         df.insert(0, "Client", client_name)
         if occupation:
             df.insert(1, "Occupation", occupation)

@@ -1,74 +1,30 @@
-# app.py — NZ Job Scraper for Clients (Seek-only) with Occupation from Airtable
+# NZ Job Scraper (Streamlit Cloud) — simple, stable version
+# Uses SerpAPI Google Jobs with next_page_token pagination.
+# No Airtable, no filters — just return jobs and let you download a CSV.
 
 import os
+import time
 from datetime import datetime
 from urllib.parse import urlparse
 
-import requests
 import pandas as pd
 import streamlit as st
+from serpapi import GoogleSearch
 
-from csv_scraper.scraper_serp import scrape_serp_jobs
+st.set_page_config(page_title="NZ Job Scraper", page_icon="🔎", layout="wide")
+st.title("🔎 NZ Job Scraper (Streamlit Cloud)")
+st.caption("Runs on Streamlit Cloud using SerpAPI — no local installs needed.")
 
-st.set_page_config(page_title="NZ Job Scraper for Clients", page_icon="🧑‍💼", layout="wide")
-st.markdown("## 🧑‍💼 NZ Job Scraper for Clients")
+# --- Helpers -----------------------------------------------------------------
+def get_key() -> str | None:
+    # Works with either name; use SERPAPI_KEY if you can
+    return str(st.secrets.get("SERPAPI_KEY", st.secrets.get("GOOGLE_API_KEY", "")) or "")
 
-# ---------------- Secrets helpers ----------------
-def get_secret(name: str, default: str | None = None) -> str | None:
-    return str(st.secrets.get(name, os.getenv(name, default)) or "")
-
-# SerpAPI key (either name is fine)
-SERPAPI_KEY            = get_secret("SERPAPI_KEY") or get_secret("GOOGLE_API_KEY")
-
-AIRTABLE_API_KEY       = get_secret("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID       = get_secret("AIRTABLE_BASE_ID")
-AIRTABLE_CLIENTS_TABLE = get_secret("AIRTABLE_CLIENTS_TABLE", "Job Seekers")
-AIRTABLE_VIEW          = get_secret("AIRTABLE_VIEW", "Grid view")
-AIRTABLE_CLIENT_FIELD  = get_secret("AIRTABLE_CLIENT_FIELD", "Full Name")
-AIRTABLE_CLIENT_PROF   = get_secret("AIRTABLE_CLIENT_PROF_FIELD", "Profession")
-
-st.caption(
-    f"Clients from Airtable → **{AIRTABLE_CLIENTS_TABLE} / {AIRTABLE_VIEW} / "
-    f"{AIRTABLE_CLIENT_FIELD} + {AIRTABLE_CLIENT_PROF}**"
-)
-
-# ---------------- Airtable fetch (name + profession) ----------------
-def fetch_airtable_clients() -> list[dict]:
-    if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_CLIENTS_TABLE):
-        return []
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_CLIENTS_TABLE)}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    params = {"view": AIRTABLE_VIEW} if AIRTABLE_VIEW else {}
-
-    rows, offset = [], None
-    while True:
-        if offset:
-            params["offset"] = offset
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        for rec in payload.get("records", []):
-            f = rec.get("fields", {})
-            name = (f.get(AIRTABLE_CLIENT_FIELD) or "").strip()
-            prof = (f.get(AIRTABLE_CLIENT_PROF) or "").strip()
-            if name:
-                rows.append({"name": name, "profession": prof})
-        offset = payload.get("offset")
-        if not offset:
-            break
-
-    seen, out = set(), []
-    for row in rows:
-        if row["name"] not in seen:
-            seen.add(row["name"]); out.append(row)
-    return out
-
-# ---------------- Seek-only helpers ----------------
-SEEK_DOMAINS = ["seek.co.nz", "seek.com", "seek.com.au", "nz.seek.co.nz"]
-
-def is_seek_link(url: str) -> bool:
-    host = urlparse(url or "").netloc.lower()
-    return any(d in host for d in SEEK_DOMAINS)
+def first_nonempty(*vals):
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 def normalize_filename(s: str) -> str:
     s = (s or "").strip().replace(" ", "_")
@@ -77,75 +33,107 @@ def normalize_filename(s: str) -> str:
         cleaned = cleaned.replace("__", "_")
     return cleaned[:120] or "results"
 
-# ---------------- UI ----------------
-colA, colB = st.columns([1, 2])
+def scrape_jobs(query: str, location: str = "New Zealand", pages: int = 2, api_key: str | None = None):
+    """Return a list of job dicts from Google Jobs via SerpAPI."""
+    key = api_key or get_key()
+    if not key:
+        raise RuntimeError("Missing SERPAPI_KEY (or GOOGLE_API_KEY) in Streamlit secrets.")
 
-with colA:
-    clients = []
-    try:
-        clients = fetch_airtable_clients()
-    except Exception as e:
-        st.error(f"Airtable error: {e}")
+    rows, seen_links = [], set()
+    next_token = None
+    pages_left = max(1, int(pages))
 
-    names = [c["name"] for c in clients]
-    selected_name = (
-        st.selectbox("Choose a client", names, index=0) if names
-        else st.text_input("Client name", placeholder="Type a name…")
-    )
-    selected = next((c for c in clients if c["name"] == selected_name), None) if names else None
-    occupation = (selected or {}).get("profession", "").strip()
+    while pages_left > 0:
+        params = {
+            "engine": "google_jobs",
+            "q": query,
+            "location": location,
+            "api_key": key,
+        }
+        if next_token:
+            params["next_page_token"] = next_token
 
-with colB:
-    default_query = f"{occupation} jobs new zealand" if occupation else "Teacher jobs new zealand"
-    query = st.text_input("Job Search Query", value=default_query)
+        data = GoogleSearch(params).get_dict()
+        if "error" in data:
+            # show a clear, user-facing error
+            raise RuntimeError(f"SerpAPI error: {data['error']}")
 
-if occupation:
-    st.markdown(f"**Occupation:** {occupation}")
+        jobs = data.get("jobs_results", []) or []
+        for j in jobs:
+            title = j.get("title", "")
+            company = j.get("company_name", "")
+            loc = j.get("location", "")
+            exts = j.get("detected_extensions", {}) or {}
+            posted = first_nonempty(exts.get("posted_at"), exts.get("posted"))
 
-st.markdown("### Job board")
-st.checkbox("Seek", value=True, disabled=True, help="Only Seek is enabled.")
-run = st.button("🔍 Run Scraper", type="primary")
+            link = first_nonempty(
+                j.get("apply_link"),
+                (j.get("apply_options") or [{}])[0].get("link"),
+                j.get("link"),
+            )
+            if link and link in seen_links:
+                continue
+            if link:
+                seen_links.add(link)
 
-# ---------------- Run ----------------
+            # Try to label the source site
+            host = urlparse(link or "").netloc.lower()
+            source = first_nonempty(j.get("via"), j.get("source"), host, "Web")
+
+            rows.append({
+                "Source": source,
+                "Position Title": title,
+                "Company Name": company,
+                "Location": loc,
+                "Posted": posted,
+                "Application Weblink": link,
+            })
+
+        pages_left -= 1
+        next_token = (
+            data.get("serpapi_pagination", {}).get("next_page_token")
+            or data.get("search_metadata", {}).get("next_page_token")
+        )
+        if not next_token:
+            break
+
+        time.sleep(0.6)  # gentle rate limit
+
+    return rows
+
+# --- UI ----------------------------------------------------------------------
+col1, col2 = st.columns([2, 1])
+with col1:
+    query = st.text_input("Search query", value="mechanical design engineer new zealand")
+with col2:
+    pages = st.slider("Pages (×10 results)", min_value=1, max_value=5, value=2)
+
+run = st.button("🚀 Scrape Now", type="primary")
+
 if run:
-    client_name = selected_name
-    if not client_name.strip():
-        st.error("Please choose or enter a client name."); st.stop()
     if not query.strip():
-        st.error("Please enter a search query."); st.stop()
-    if not SERPAPI_KEY:
-        st.error("Missing SERPAPI_KEY (or GOOGLE_API_KEY) in Secrets."); st.stop()
+        st.error("Please enter a search query.")
+        st.stop()
 
-    with st.status("🔎 Searching Seek via Google Jobs (SerpAPI)…", expanded=True) as status:
-        st.write(f"Client: **{client_name}**")
-        if occupation:
-            st.write(f"Occupation: **{occupation}**")
-        st.write(f"Query: **{query}**")
-
+    with st.status("Searching Google Jobs…", expanded=True) as status:
+        st.write(f"Query: **{query}**, Pages: **{pages}**")
         try:
-            raw_jobs = scrape_serp_jobs(query, location="New Zealand", num_pages=3, api_key=SERPAPI_KEY)
+            jobs = scrape_jobs(query=query, location="New Zealand", pages=pages)
         except Exception as e:
-            st.error(f"Search failed: {e}")
+            st.error(str(e))
             st.stop()
 
-        seek_jobs = [j for j in raw_jobs if is_seek_link(j.get("Application Weblink", ""))]
+        status.update(label="✅ Done", state="complete")
 
-        st.write(f"Fetched {len(raw_jobs)} jobs; {len(seek_jobs)} from Seek.")
-        status.update(label="✨ Finished search", state="complete")
-
-    df = pd.DataFrame(seek_jobs)
+    df = pd.DataFrame(jobs)
     if df.empty:
-        st.warning("No Seek jobs found for this query.")
+        st.warning("No jobs found for this query. Try a broader phrase.")
     else:
-        df.insert(0, "Client", client_name)
-        if occupation:
-            df.insert(1, "Occupation", occupation)
-
-        st.success(f"Found {len(df):,} Seek jobs.")
+        st.success(f"Found {len(df):,} jobs.")
         st.dataframe(df, use_container_width=True)
 
         ts = datetime.now().strftime("%Y%m%d-%H%M")
-        fname = f"{normalize_filename(client_name)}_{normalize_filename(query)}_{ts}_SEEK.csv"
+        fname = f"{normalize_filename(query)}_{ts}.csv"
         st.download_button(
             "⬇️ Download CSV",
             df.to_csv(index=False).encode("utf-8-sig"),
@@ -154,4 +142,4 @@ if run:
         )
 
 st.markdown("---")
-st.caption("Client & Occupation pulled from Airtable. Jobs filtered to Seek only.")
+st.caption("Simple, reliable version. To re-add clients/Airtable later, we can layer it back once you're ready.")

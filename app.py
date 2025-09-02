@@ -1,22 +1,26 @@
 import os
 import time
+import logging
 from datetime import datetime
-from urllib.parse import urlparse
+from pathlib import Path
+from urllib.parse import quote_plus
 
 import requests
 import pandas as pd
 import streamlit as st
-from serpapi import GoogleSearch
+from bs4 import BeautifulSoup
 
-# Page config
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("job-scraper")
+
 st.set_page_config(page_title="NZ Job Scraper for Clients", page_icon="🧑‍💼", layout="wide")
 st.title("🧑‍💼 NZ Job Scraper for Clients")
 
-# Get secrets
+# --- Secrets helpers ---
 def get_secret(name: str, default: str = "") -> str:
     return str(st.secrets.get(name, os.getenv(name, default)) or "")
 
-SERPAPI_KEY = get_secret("SERPAPI_KEY") or get_secret("GOOGLE_API_KEY")
 AIRTABLE_API_KEY = get_secret("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = get_secret("AIRTABLE_BASE_ID")
 AIRTABLE_CLIENTS_TABLE = get_secret("AIRTABLE_CLIENTS_TABLE", "Job Seekers")
@@ -24,7 +28,7 @@ AIRTABLE_VIEW = get_secret("AIRTABLE_VIEW", "Grid view")
 AIRTABLE_CLIENT_FIELD = get_secret("AIRTABLE_CLIENT_FIELD", "Full Name")
 AIRTABLE_CLIENT_PROF_FIELD = get_secret("AIRTABLE_CLIENT_PROF_FIELD", "Profession")
 
-# Fetch clients from Airtable
+# --- Airtable fetch (your working version) ---
 @st.cache_data(ttl=300)
 def fetch_clients():
     if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_CLIENTS_TABLE]):
@@ -65,110 +69,144 @@ def fetch_clients():
         st.error(f"Error fetching clients from Airtable: {e}")
         return []
 
-# Scrape jobs using SerpAPI
-def scrape_jobs(query: str, location: str = "New Zealand", num_pages: int = 2):
-    if not SERPAPI_KEY:
-        raise ValueError("SERPAPI_KEY is required in Streamlit secrets")
+# --- Direct Seek scraping (adapted from your working scraper_seek.py) ---
+def scrape_seek_direct(query: str):
+    """Direct HTTP scraping of Seek (no Selenium needed for basic scraping)"""
+    if not query:
+        return []
     
-    all_jobs = []
-    next_token = None
-    pages_scraped = 0
+    jobs = []
     
-    while pages_scraped < num_pages:
-        params = {
-            "engine": "google_jobs",
-            "q": query,
-            "location": location,
-            "api_key": SERPAPI_KEY
+    try:
+        # Use the same URL pattern as your working scraper
+        url = f"https://www.seek.co.nz/{quote_plus(query)}-jobs"
+        logger.info(f"🔎 Seek URL: {url}")
+        
+        # Headers to mimic a real browser
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
         }
         
-        if next_token:
-            params["next_page_token"] = next_token
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
         
-        try:
-            search = GoogleSearch(params)
-            results = search.get_dict()
+        # Use your exact parsing logic from scraper_seek.py
+        soup = BeautifulSoup(response.content, "html.parser")
+        
+        # Your exact CSS selectors
+        cards = soup.select("[data-automation='searchResults'] article, article") or soup.select("a[href*='/job/'], [data-automation='job-card']")
+        
+        for card in cards:
+            # Your exact parsing logic
+            title_el = card.select_one("[data-automation='jobTitle']") or card.select_one("a[data-automation]")
+            title = (title_el.get_text(strip=True) if title_el else "") or (card.get("aria-label") or "").strip()
             
-            if "error" in results:
-                raise ValueError(f"SerpAPI error: {results['error']}")
+            link = ""
+            link_el = card.select_one("a[href*='/job/']")
+            if link_el and link_el.get("href"):
+                href = link_el["href"]
+                link = href if href.startswith("http") else f"https://www.seek.co.nz{href}"
             
-            jobs = results.get("jobs_results", [])
+            company_el = card.select_one("[data-automation='jobCompany']")
+            company = company_el.get_text(strip=True) if company_el else ""
             
-            if not jobs:
-                break
-                
-            for job in jobs:
-                # Extract job details
-                title = job.get("title", "")
-                company = job.get("company_name", "")
-                job_location = job.get("location", "")
-                
-                # Get posting date
-                extensions = job.get("detected_extensions", {})
-                posted = extensions.get("posted_at", "") or extensions.get("posted", "")
-                
-                # Get application link
-                apply_link = ""
-                if job.get("apply_link"):
-                    apply_link = job["apply_link"]
-                elif job.get("apply_options") and len(job["apply_options"]) > 0:
-                    apply_link = job["apply_options"][0].get("link", "")
-                elif job.get("link"):
-                    apply_link = job["link"]
-                
-                # Determine source
-                source = job.get("via", "")
-                if not source:
-                    # Try to determine from URL
-                    if apply_link:
-                        host = urlparse(apply_link).netloc.lower()
-                        if "seek.co.nz" in host or "seek.com" in host:
-                            source = "Seek"
-                        elif "trademe.co.nz" in host:
-                            source = "Trade Me"
-                        elif "indeed" in host:
-                            source = "Indeed"
-                        elif "jora" in host:
-                            source = "Jora"
-                        else:
-                            source = host or "Web"
-                    else:
-                        source = "Web"
-                
-                all_jobs.append({
-                    "Source": source,
+            loc_el = card.select_one("[data-automation='jobLocation']")
+            location = loc_el.get_text(strip=True) if loc_el else ""
+            
+            posted_el = card.select_one("[data-automation='jobListingDate']")
+            posted = posted_el.get_text(strip=True) if posted_el else ""
+            
+            if title and link:
+                jobs.append({
+                    "Source": "Seek",
                     "Position Title": title,
                     "Company Name": company,
-                    "Location": job_location,
+                    "Location": location,
                     "Posted": posted,
-                    "Application Weblink": apply_link
+                    "Application Weblink": link,
                 })
-            
-            # Get next page token
-            serpapi_pagination = results.get("serpapi_pagination", {})
-            next_token = serpapi_pagination.get("next_page_token")
-            
-            if not next_token:
-                break
-                
-            pages_scraped += 1
-            time.sleep(0.5)  # Rate limiting
-            
-        except Exception as e:
-            raise ValueError(f"Error scraping jobs: {str(e)}")
+        
+        logger.info(f"✅ Found {len(jobs)} jobs from Seek")
+        return jobs
+        
+    except requests.RequestException as e:
+        logger.error(f"Error scraping Seek: {e}")
+        st.warning(f"Could not scrape Seek directly: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        st.warning(f"Unexpected error scraping Seek: {e}")
+        return []
+
+# --- TradeMe scraping (simplified version) ---
+def scrape_trademe_direct(query: str):
+    """Direct HTTP scraping of TradeMe Jobs"""
+    if not query:
+        return []
     
-    return all_jobs
+    jobs = []
+    try:
+        # TradeMe jobs URL pattern
+        url = f"https://www.trademe.co.nz/jobs/search?search_string={quote_plus(query)}"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, "html.parser")
+        
+        # TradeMe specific selectors (you'd need to inspect their page)
+        job_cards = soup.select("div[data-testid*='listing']") or soup.select(".listing-item")
+        
+        for card in job_cards:
+            title_el = card.select_one("h3 a, .listing-title a")
+            title = title_el.get_text(strip=True) if title_el else ""
+            
+            link = ""
+            if title_el and title_el.get("href"):
+                href = title_el["href"]
+                link = href if href.startswith("http") else f"https://www.trademe.co.nz{href}"
+            
+            # Extract other fields as available
+            company = ""  # TradeMe might not always show company
+            location_el = card.select_one(".location, .listing-region")
+            location = location_el.get_text(strip=True) if location_el else ""
+            
+            if title and link:
+                jobs.append({
+                    "Source": "TradeMe",
+                    "Position Title": title,
+                    "Company Name": company,
+                    "Location": location,
+                    "Posted": "",
+                    "Application Weblink": link,
+                })
+        
+        logger.info(f"✅ Found {len(jobs)} jobs from TradeMe")
+        return jobs
+        
+    except Exception as e:
+        logger.error(f"Error scraping TradeMe: {e}")
+        st.warning(f"Could not scrape TradeMe: {e}")
+        return []
 
 # Helper function
 def normalize_filename(text: str) -> str:
     text = text.strip().replace(" ", "_")
     return "".join(c for c in text if c.isalnum() or c in ("_", "-"))[:50]
 
-# Main UI
+# --- UI (your working version) ---
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    # Client selection
+    # Client selection (your working approach)
     clients_data = fetch_clients()
     
     if clients_data:
@@ -191,18 +229,21 @@ with col1:
         selected_client = {"name": selected_client_name, "profession": profession}
 
 with col2:
-    # Query input with auto-fill
+    # Query input with auto-fill (your working approach)
     default_query = f"{profession} jobs new zealand" if profession else "jobs new zealand"
     query = st.text_input("Job search query", value=default_query)
 
-# Additional controls
-num_pages = st.slider("Number of pages to scrape", min_value=1, max_value=5, value=2, 
-                      help="Each page contains approximately 10 job results")
+# Job boards selection (your working UI)
+st.markdown("### Choose job boards to search:")
+use_seek = st.checkbox("Seek", value=True)
+use_trademe = st.checkbox("TradeMe", value=True)
+use_indeed = st.checkbox("Indeed", value=False, disabled=True, help="Indeed blocks scraping")
+use_glassdoor = st.checkbox("Glassdoor", value=False, disabled=True, help="Not yet implemented")
 
 # Run button
 run_scraper = st.button("🔍 Run Scraper", type="primary")
 
-# Execute scraping
+# Execute scraping (your working approach)
 if run_scraper:
     if not selected_client["name"].strip():
         st.error("Please select or enter a client name.")
@@ -212,42 +253,55 @@ if run_scraper:
         st.error("Please enter a search query.")
         st.stop()
     
-    if not SERPAPI_KEY:
-        st.error("SERPAPI_KEY is missing from Streamlit secrets. Please add it in Settings > Secrets.")
-        st.stop()
-    
     # Show search progress
-    with st.status("🔎 Searching for jobs...", expanded=True) as status:
+    with st.status("🔎 Scraping job boards...", expanded=True) as status:
         st.write(f"**Client:** {selected_client['name']}")
         if selected_client.get('profession'):
             st.write(f"**Profession:** {selected_client['profession']}")
         st.write(f"**Query:** {query}")
-        st.write(f"**Pages to scrape:** {num_pages}")
         
-        try:
-            jobs = scrape_jobs(query, num_pages=num_pages)
-            status.update(label="✅ Search completed!", state="complete")
-        except Exception as e:
-            st.error(f"Search failed: {e}")
-            st.stop()
+        all_jobs = []
+        
+        # Scrape each selected board
+        if use_seek:
+            st.write("🔎 Searching Seek...")
+            seek_jobs = scrape_seek_direct(query)
+            all_jobs.extend(seek_jobs)
+            
+        if use_trademe:
+            st.write("🔎 Searching TradeMe...")
+            trademe_jobs = scrape_trademe_direct(query)
+            all_jobs.extend(trademe_jobs)
+        
+        status.update(label="✅ Scraping completed!", state="complete")
     
-    if not jobs:
-        st.warning("No jobs found for this query. Try adjusting your search terms.")
+    if not all_jobs:
+        st.warning("No jobs found. This could be because:")
+        st.write("• The job sites changed their HTML structure")
+        st.write("• They're blocking requests from cloud servers")  
+        st.write("• Try simpler search terms")
+        
+        # Debug info
+        with st.expander("Debug: What we tried"):
+            if use_seek:
+                st.write(f"Seek URL: https://www.seek.co.nz/{quote_plus(query)}-jobs")
+            if use_trademe:
+                st.write(f"TradeMe URL: https://www.trademe.co.nz/jobs/search?search_string={quote_plus(query)}")
     else:
-        # Create DataFrame
-        df = pd.DataFrame(jobs)
+        # Create DataFrame (your working approach)
+        df = pd.DataFrame(all_jobs)
         
         # Add client information to the data
         df.insert(0, "Client", selected_client["name"])
         if selected_client.get("profession"):
             df.insert(1, "Client Profession", selected_client["profession"])
         
-        st.success(f"Found {len(jobs)} jobs!")
+        st.success(f"Found {len(all_jobs)} jobs!")
         
         # Display results
         st.dataframe(df, use_container_width=True)
         
-        # Download button
+        # Download button (your working approach)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         client_safe = normalize_filename(selected_client["name"])
         filename = f"{client_safe}_jobs_{timestamp}.csv"
@@ -260,12 +314,12 @@ if run_scraper:
             mime="text/csv"
         )
         
-        # Show summary
-        st.markdown("### Summary")
+        # Show summary by source
+        st.markdown("### Results by Source")
         source_counts = df["Source"].value_counts()
         for source, count in source_counts.items():
             st.write(f"• {source}: {count} jobs")
 
 # Footer
 st.markdown("---")
-st.caption("Powered by SerpAPI • Client data from Airtable")
+st.caption("Direct scraping approach based on your working local scraper • Client data from Airtable")

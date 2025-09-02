@@ -1,18 +1,12 @@
 import os
 import time
-import logging
 from datetime import datetime
-from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import urlparse
 
 import requests
 import pandas as pd
 import streamlit as st
-from bs4 import BeautifulSoup
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("job-scraper")
+from serpapi import GoogleSearch
 
 st.set_page_config(page_title="NZ Job Scraper for Clients", page_icon="🧑‍💼", layout="wide")
 st.title("🧑‍💼 NZ Job Scraper for Clients")
@@ -21,6 +15,7 @@ st.title("🧑‍💼 NZ Job Scraper for Clients")
 def get_secret(name: str, default: str = "") -> str:
     return str(st.secrets.get(name, os.getenv(name, default)) or "")
 
+SERPAPI_KEY = get_secret("SERPAPI_KEY") or get_secret("GOOGLE_API_KEY")
 AIRTABLE_API_KEY = get_secret("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = get_secret("AIRTABLE_BASE_ID")
 AIRTABLE_CLIENTS_TABLE = get_secret("AIRTABLE_CLIENTS_TABLE", "Job Seekers")
@@ -28,7 +23,7 @@ AIRTABLE_VIEW = get_secret("AIRTABLE_VIEW", "Grid view")
 AIRTABLE_CLIENT_FIELD = get_secret("AIRTABLE_CLIENT_FIELD", "Full Name")
 AIRTABLE_CLIENT_PROF_FIELD = get_secret("AIRTABLE_CLIENT_PROF_FIELD", "Profession")
 
-# --- Airtable fetch (your working version) ---
+# --- Airtable fetch ---
 @st.cache_data(ttl=300)
 def fetch_clients():
     if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_CLIENTS_TABLE]):
@@ -69,151 +64,198 @@ def fetch_clients():
         st.error(f"Error fetching clients from Airtable: {e}")
         return []
 
-# --- Direct Seek scraping (adapted from your working scraper_seek.py) ---
-def scrape_seek_direct(query: str):
-    """Direct HTTP scraping of Seek (no Selenium needed for basic scraping)"""
-    if not query:
-        return []
+# --- Enhanced job scraping with multiple strategies ---
+def scrape_jobs_smart(query: str, location: str = "New Zealand"):
+    """
+    Multi-strategy job search that tries different approaches to find jobs
+    """
+    if not SERPAPI_KEY:
+        raise ValueError("SERPAPI_KEY is required in Streamlit secrets")
     
-    jobs = []
+    all_jobs = []
     
-    try:
-        # Use the same URL pattern as your working scraper
-        url = f"https://www.seek.co.nz/{quote_plus(query)}-jobs"
-        logger.info(f"🔎 Seek URL: {url}")
+    # Strategy 1: Direct site searches (most effective)
+    site_strategies = [
+        f"site:seek.co.nz {query}",
+        f"site:trademe.co.nz {query}",
+        f"site:indeed.co.nz {query}",
+        f"site:jora.co.nz {query}",
+    ]
+    
+    for i, site_query in enumerate(site_strategies):
+        site_name = site_query.split()[0].replace("site:", "").replace(".co.nz", "").replace(".com", "").title()
         
-        # Headers to mimic a real browser
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-        }
-        
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        # Use your exact parsing logic from scraper_seek.py
-        soup = BeautifulSoup(response.content, "html.parser")
-        
-        # Your exact CSS selectors
-        cards = soup.select("[data-automation='searchResults'] article, article") or soup.select("a[href*='/job/'], [data-automation='job-card']")
-        
-        for card in cards:
-            # Your exact parsing logic
-            title_el = card.select_one("[data-automation='jobTitle']") or card.select_one("a[data-automation]")
-            title = (title_el.get_text(strip=True) if title_el else "") or (card.get("aria-label") or "").strip()
+        try:
+            st.write(f"🔍 Searching {site_name}...")
             
-            link = ""
-            link_el = card.select_one("a[href*='/job/']")
-            if link_el and link_el.get("href"):
-                href = link_el["href"]
-                link = href if href.startswith("http") else f"https://www.seek.co.nz{href}"
+            params = {
+                "engine": "google",  # Use regular Google search, not google_jobs
+                "q": site_query,
+                "location": location,
+                "api_key": SERPAPI_KEY,
+                "num": 20,  # Get more results
+            }
             
-            company_el = card.select_one("[data-automation='jobCompany']")
-            company = company_el.get_text(strip=True) if company_el else ""
+            search = GoogleSearch(params)
+            results = search.get_dict()
             
-            loc_el = card.select_one("[data-automation='jobLocation']")
-            location = loc_el.get_text(strip=True) if loc_el else ""
+            if "error" in results:
+                st.write(f"❌ {site_name} error: {results['error']}")
+                continue
             
-            posted_el = card.select_one("[data-automation='jobListingDate']")
-            posted = posted_el.get_text(strip=True) if posted_el else ""
+            organic_results = results.get("organic_results", [])
+            site_jobs = []
             
-            if title and link:
-                jobs.append({
-                    "Source": "Seek",
+            for result in organic_results:
+                title = result.get("title", "")
+                link = result.get("link", "")
+                snippet = result.get("snippet", "")
+                
+                # Skip non-job results
+                if not any(word in title.lower() for word in ["job", "career", "position", "vacancy", "role"]):
+                    if not any(word in snippet.lower() for word in ["job", "career", "apply", "position", "vacancy"]):
+                        continue
+                
+                # Extract company and location from snippet/title
+                company = ""
+                job_location = ""
+                
+                # Try to extract company from snippet
+                if " at " in snippet:
+                    company = snippet.split(" at ")[1].split(".")[0].split(",")[0].strip()
+                elif " - " in title:
+                    parts = title.split(" - ")
+                    if len(parts) > 1:
+                        company = parts[-1].strip()
+                
+                # Try to extract location
+                if "auckland" in snippet.lower():
+                    job_location = "Auckland"
+                elif "wellington" in snippet.lower():
+                    job_location = "Wellington"
+                elif "christchurch" in snippet.lower():
+                    job_location = "Christchurch"
+                elif "new zealand" in snippet.lower():
+                    job_location = "New Zealand"
+                
+                site_jobs.append({
+                    "Source": site_name,
                     "Position Title": title,
                     "Company Name": company,
-                    "Location": location,
-                    "Posted": posted,
-                    "Application Weblink": link,
-                })
-        
-        logger.info(f"✅ Found {len(jobs)} jobs from Seek")
-        return jobs
-        
-    except requests.RequestException as e:
-        logger.error(f"Error scraping Seek: {e}")
-        st.warning(f"Could not scrape Seek directly: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        st.warning(f"Unexpected error scraping Seek: {e}")
-        return []
-
-# --- TradeMe scraping (simplified version) ---
-def scrape_trademe_direct(query: str):
-    """Direct HTTP scraping of TradeMe Jobs"""
-    if not query:
-        return []
-    
-    jobs = []
-    try:
-        # TradeMe jobs URL pattern
-        url = f"https://www.trademe.co.nz/jobs/search?search_string={quote_plus(query)}"
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        }
-        
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, "html.parser")
-        
-        # TradeMe specific selectors (you'd need to inspect their page)
-        job_cards = soup.select("div[data-testid*='listing']") or soup.select(".listing-item")
-        
-        for card in job_cards:
-            title_el = card.select_one("h3 a, .listing-title a")
-            title = title_el.get_text(strip=True) if title_el else ""
-            
-            link = ""
-            if title_el and title_el.get("href"):
-                href = title_el["href"]
-                link = href if href.startswith("http") else f"https://www.trademe.co.nz{href}"
-            
-            # Extract other fields as available
-            company = ""  # TradeMe might not always show company
-            location_el = card.select_one(".location, .listing-region")
-            location = location_el.get_text(strip=True) if location_el else ""
-            
-            if title and link:
-                jobs.append({
-                    "Source": "TradeMe",
-                    "Position Title": title,
-                    "Company Name": company,
-                    "Location": location,
+                    "Location": job_location,
                     "Posted": "",
                     "Application Weblink": link,
+                    "Description": snippet[:200] + "..." if len(snippet) > 200 else snippet
                 })
+            
+            all_jobs.extend(site_jobs)
+            st.write(f"✅ {site_name}: Found {len(site_jobs)} jobs")
+            
+            time.sleep(1)  # Rate limiting
+            
+        except Exception as e:
+            st.write(f"❌ {site_name} error: {str(e)}")
+            continue
+    
+    # Strategy 2: Generic job searches if we don't have enough results
+    if len(all_jobs) < 10:
+        generic_queries = [
+            f'"{query}" jobs {location}',
+            f'{query} career {location}',
+            f'{query} position {location}',
+        ]
         
-        logger.info(f"✅ Found {len(jobs)} jobs from TradeMe")
-        return jobs
-        
-    except Exception as e:
-        logger.error(f"Error scraping TradeMe: {e}")
-        st.warning(f"Could not scrape TradeMe: {e}")
-        return []
+        for generic_query in generic_queries:
+            if len(all_jobs) >= 20:  # Stop if we have enough
+                break
+                
+            try:
+                st.write(f"🔍 Trying: {generic_query}")
+                
+                params = {
+                    "engine": "google_jobs",  # Try Google Jobs for generic searches
+                    "q": generic_query,
+                    "location": location,
+                    "api_key": SERPAPI_KEY,
+                }
+                
+                search = GoogleSearch(params)
+                results = search.get_dict()
+                
+                if "error" in results:
+                    continue
+                
+                jobs_results = results.get("jobs_results", [])
+                
+                for job in jobs_results:
+                    title = job.get("title", "")
+                    company = job.get("company_name", "")
+                    job_location = job.get("location", "")
+                    
+                    extensions = job.get("detected_extensions", {})
+                    posted = extensions.get("posted_at", "") or extensions.get("posted", "")
+                    
+                    apply_link = (job.get("apply_link") or 
+                                (job.get("apply_options", [{}])[0].get("link")) or
+                                job.get("link", ""))
+                    
+                    # Determine source from link
+                    source = "Web"
+                    if apply_link:
+                        host = urlparse(apply_link).netloc.lower()
+                        if "seek" in host:
+                            source = "Seek"
+                        elif "trademe" in host:
+                            source = "TradeMe"
+                        elif "indeed" in host:
+                            source = "Indeed"
+                        elif "jora" in host:
+                            source = "Jora"
+                    
+                    all_jobs.append({
+                        "Source": source,
+                        "Position Title": title,
+                        "Company Name": company,
+                        "Location": job_location,
+                        "Posted": posted,
+                        "Application Weblink": apply_link,
+                        "Description": job.get("description", "")[:200] + "..."
+                    })
+                
+                st.write(f"✅ Generic search: Found {len(jobs_results)} additional jobs")
+                time.sleep(1)
+                
+            except Exception as e:
+                st.write(f"❌ Generic search error: {str(e)}")
+                continue
+    
+    # Remove duplicates based on title + company
+    unique_jobs = []
+    seen = set()
+    
+    for job in all_jobs:
+        key = (job.get("Position Title", "").lower().strip(), 
+               job.get("Company Name", "").lower().strip())
+        if key not in seen and key != ("", ""):
+            seen.add(key)
+            unique_jobs.append(job)
+    
+    return unique_jobs
 
-# Helper function
 def normalize_filename(text: str) -> str:
     text = text.strip().replace(" ", "_")
     return "".join(c for c in text if c.isalnum() or c in ("_", "-"))[:50]
 
-# --- UI (your working version) ---
+# --- UI ---
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    # Client selection (your working approach)
     clients_data = fetch_clients()
     
     if clients_data:
         client_names = [client["name"] for client in clients_data]
         selected_client_name = st.selectbox("Choose a client", client_names)
         
-        # Find selected client's data
         selected_client = next(
             (client for client in clients_data if client["name"] == selected_client_name), 
             {"name": selected_client_name, "profession": ""}
@@ -229,21 +271,24 @@ with col1:
         selected_client = {"name": selected_client_name, "profession": profession}
 
 with col2:
-    # Query input with auto-fill (your working approach)
-    default_query = f"{profession} jobs new zealand" if profession else "jobs new zealand"
-    query = st.text_input("Job search query", value=default_query)
+    # Smart query building
+    if profession:
+        # Remove common suffixes that don't help with searching
+        clean_profession = profession.replace(" jobs", "").replace(" new zealand", "").strip()
+        default_query = clean_profession
+    else:
+        default_query = "jobs"
+    
+    query = st.text_input("Job search query", value=default_query,
+                         help="Use simple terms like 'teacher' or 'engineer' - avoid 'jobs new zealand'")
 
-# Job boards selection (your working UI)
-st.markdown("### Choose job boards to search:")
-use_seek = st.checkbox("Seek", value=True)
-use_trademe = st.checkbox("TradeMe", value=True)
-use_indeed = st.checkbox("Indeed", value=False, disabled=True, help="Indeed blocks scraping")
-use_glassdoor = st.checkbox("Glassdoor", value=False, disabled=True, help="Not yet implemented")
+# Info box
+st.info("💡 **Search Tips:** Use simple job titles (e.g., 'teacher', 'engineer', 'plumber') rather than full phrases. The system will search across multiple NZ job sites.")
 
 # Run button
 run_scraper = st.button("🔍 Run Scraper", type="primary")
 
-# Execute scraping (your working approach)
+# Execute scraping
 if run_scraper:
     if not selected_client["name"].strip():
         st.error("Please select or enter a client name.")
@@ -253,55 +298,44 @@ if run_scraper:
         st.error("Please enter a search query.")
         st.stop()
     
+    if not SERPAPI_KEY:
+        st.error("SERPAPI_KEY is missing from Streamlit secrets. Please add it in Settings > Secrets.")
+        st.stop()
+    
     # Show search progress
-    with st.status("🔎 Scraping job boards...", expanded=True) as status:
+    with st.status("🔎 Searching job boards...", expanded=True) as status:
         st.write(f"**Client:** {selected_client['name']}")
         if selected_client.get('profession'):
             st.write(f"**Profession:** {selected_client['profession']}")
         st.write(f"**Query:** {query}")
         
-        all_jobs = []
-        
-        # Scrape each selected board
-        if use_seek:
-            st.write("🔎 Searching Seek...")
-            seek_jobs = scrape_seek_direct(query)
-            all_jobs.extend(seek_jobs)
-            
-        if use_trademe:
-            st.write("🔎 Searching TradeMe...")
-            trademe_jobs = scrape_trademe_direct(query)
-            all_jobs.extend(trademe_jobs)
-        
-        status.update(label="✅ Scraping completed!", state="complete")
+        try:
+            jobs = scrape_jobs_smart(query)
+            status.update(label="✅ Search completed!", state="complete")
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+            st.stop()
     
-    if not all_jobs:
-        st.warning("No jobs found. This could be because:")
-        st.write("• The job sites changed their HTML structure")
-        st.write("• They're blocking requests from cloud servers")  
-        st.write("• Try simpler search terms")
-        
-        # Debug info
-        with st.expander("Debug: What we tried"):
-            if use_seek:
-                st.write(f"Seek URL: https://www.seek.co.nz/{quote_plus(query)}-jobs")
-            if use_trademe:
-                st.write(f"TradeMe URL: https://www.trademe.co.nz/jobs/search?search_string={quote_plus(query)}")
+    if not jobs:
+        st.warning("No jobs found for this query. Try:")
+        st.write("• Simpler terms: 'teacher' instead of 'primary school teacher'")
+        st.write("• Different keywords: 'health safety' instead of 'HSE'")
+        st.write("• Broader terms: 'engineer' instead of 'mechanical engineer'")
     else:
-        # Create DataFrame (your working approach)
-        df = pd.DataFrame(all_jobs)
+        # Create DataFrame
+        df = pd.DataFrame(jobs)
         
-        # Add client information to the data
+        # Add client information
         df.insert(0, "Client", selected_client["name"])
         if selected_client.get("profession"):
             df.insert(1, "Client Profession", selected_client["profession"])
         
-        st.success(f"Found {len(all_jobs)} jobs!")
+        st.success(f"Found {len(jobs)} jobs!")
         
         # Display results
         st.dataframe(df, use_container_width=True)
         
-        # Download button (your working approach)
+        # Download button
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         client_safe = normalize_filename(selected_client["name"])
         filename = f"{client_safe}_jobs_{timestamp}.csv"
@@ -314,12 +348,12 @@ if run_scraper:
             mime="text/csv"
         )
         
-        # Show summary by source
-        st.markdown("### Results by Source")
+        # Show summary
+        st.markdown("### Results Summary")
         source_counts = df["Source"].value_counts()
         for source, count in source_counts.items():
             st.write(f"• {source}: {count} jobs")
 
 # Footer
 st.markdown("---")
-st.caption("Direct scraping approach based on your working local scraper • Client data from Airtable")
+st.caption("🔄 **Smart Search Strategy:** Uses site-specific searches to bypass anti-bot protection • Client data from Airtable")

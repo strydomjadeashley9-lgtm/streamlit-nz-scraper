@@ -2,54 +2,58 @@ import os
 from datetime import datetime
 from urllib.parse import urlparse
 
+import requests
 import pandas as pd
 import streamlit as st
 
-# Uses the non-browser scraper we added for Streamlit Cloud
 from csv_scraper.scraper_serp import scrape_serp_jobs
 
-# ---------- Page setup ----------
 st.set_page_config(page_title="NZ Job Scraper for Clients", page_icon="🧑‍💼", layout="wide")
-
-# Subtle styling to match your “client” look
-st.markdown("""
-<style>
-/* headings */
-h1, h2, h3 { letter-spacing: 0.2px; }
-/* softer widgets */
-.stButton>button {
-    border-radius: 12px; padding: 0.7rem 1.1rem; font-weight: 600;
-}
-.stCheckbox>label { font-size: 1rem; }
-.small-note { color:#6b7280; font-size:0.9rem; }
-</style>
-""", unsafe_allow_html=True)
-
-# ---------- Header ----------
 st.markdown("## 🧑‍💼 NZ Job Scraper for Clients")
 
-# ---------- Top form ----------
-colA, colB = st.columns([1,2], vertical_alignment="center")
-with colA:
-    client = st.selectbox("Choose a client", ["Oppong Millicent", "New Client…"])
-    if client == "New Client…":
-        client = st.text_input("Client name", value="", placeholder="Type a name…")
+# ---------------- Secrets ----------------
+def get_secret(name: str, default: str | None = None) -> str | None:
+    if name in st.secrets:
+        return str(st.secrets[name])
+    return os.getenv(name, default)
 
-with colB:
-    query = st.text_input("Job Search Query", value="Teacher jobs new zealand", placeholder="e.g., Boilermaker jobs New Zealand")
+GOOGLE_API_KEY       = get_secret("GOOGLE_API_KEY")
+AIRTABLE_API_KEY     = get_secret("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID     = get_secret("AIRTABLE_BASE_ID")
+AIRTABLE_CLIENTS_TABLE = get_secret("AIRTABLE_CLIENTS_TABLE", "Job Seekers")
 
-st.markdown("### Choose job boards to search:")
+# ---------------- Airtable fetch ----------------
+def fetch_airtable_clients() -> list[str]:
+    if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_CLIENTS_TABLE):
+        return []
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_CLIENTS_TABLE)}"
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    clients = []
+    offset = None
+    while True:
+        params = {}
+        if offset:
+            params["offset"] = offset
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        for rec in payload.get("records", []):
+            fields = rec.get("fields", {})
+            name = fields.get("Name") or fields.get("Client") or fields.get("Full Name")
+            if isinstance(name, str) and name.strip():
+                clients.append(name.strip())
+        offset = payload.get("offset")
+        if not offset:
+            break
+    return sorted(set(clients))
 
-cb1 = st.checkbox("Seek", value=True)
-cb2 = st.checkbox("TradeMe", value=True)
-cb3 = st.checkbox("Indeed", value=True)
-cb4 = st.checkbox("Glassdoor", value=False, disabled=True)  # placeholder for later
+# ---------------- Seek filter ----------------
+SEEK_DOMAINS = ["seek.co.nz", "seek.com", "seek.com.au", "nz.seek.co.nz"]
 
-run = st.button("🔍 Run Scraper", type="primary")
+def is_seek_link(url: str) -> bool:
+    host = urlparse(url or "").netloc.lower()
+    return any(d in host for d in SEEK_DOMAINS)
 
-st.markdown("<div class='small-note'>Tip: Results come from Google Jobs (SerpAPI). Board filters are applied by the link’s domain.</div>", unsafe_allow_html=True)
-
-# ---------- Helpers ----------
 def normalize_filename(s: str) -> str:
     s = (s or "").strip().replace(" ", "_")
     cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in s)
@@ -57,86 +61,63 @@ def normalize_filename(s: str) -> str:
         cleaned = cleaned.replace("__", "_")
     return cleaned[:120] or "results"
 
-# Map each “board” to link-domain patterns we accept
-BOARD_PATTERNS = {
-    "Seek": ["seek.co.nz", "seek.com", "seek.com.au"],
-    "TradeMe": ["trademe.co.nz"],
-    "Indeed": ["indeed.com", "indeed.co.nz"],
-    "Glassdoor": ["glassdoor.com", "glassdoor.co.nz"],  # for future use
-}
+# ---------------- UI ----------------
+colA, colB = st.columns([1, 2], vertical_alignment="center")
 
-def host_matches(host: str, patterns: list[str]) -> bool:
-    host = host.lower()
-    return any(p in host for p in patterns)
+with colA:
+    try:
+        clients = fetch_airtable_clients()
+    except Exception as e:
+        st.error(f"Error fetching clients from Airtable: {e}")
+        clients = []
 
-def filter_by_boards(df: pd.DataFrame, use_seek: bool, use_trademe: bool, use_indeed: bool):
-    # If all unchecked, return empty
-    if not any([use_seek, use_trademe, use_indeed]):
-        return df.iloc[0:0]
+    if clients:
+        client = st.selectbox("Choose a client", clients, index=0, key="client_select")
+    else:
+        client = st.text_input("Client name", value="", placeholder="Type a name…")
 
-    selected = []
-    if use_seek: selected += BOARD_PATTERNS["Seek"]
-    if use_trademe: selected += BOARD_PATTERNS["TradeMe"]
-    if use_indeed: selected += BOARD_PATTERNS["Indeed"]
+with colB:
+    query = st.text_input("Job Search Query", value="Teacher jobs new zealand")
 
-    if df.empty: return df
-    df = df.copy()
-    df["__host"] = df["Application Weblink"].fillna("").apply(lambda u: urlparse(u).netloc)
-    df = df[df["__host"].apply(lambda h: host_matches(h, selected))]
-    df = df.drop(columns=["__host"])
-    return df
+st.markdown("### Job board")
+st.checkbox("Seek", value=True, disabled=True, help="Only Seek is enabled at the moment.")
+run = st.button("🔍 Run Scraper", type="primary")
 
-# ---------- Main action ----------
+# ---------------- Run ----------------
 if run:
+    if not client.strip():
+        st.error("Please choose or enter a client name.")
+        st.stop()
     if not query.strip():
         st.error("Please enter a search query.")
         st.stop()
-
-    # Check for API key early to show a nice message
-    if not (os.getenv("GOOGLE_API_KEY") or os.getenv("SERPAPI_API_KEY")):
-        st.error("Missing SerpAPI key. In Streamlit Cloud: Settings → Secrets → add GOOGLE_API_KEY = your_serpapi_key_here")
+    if not GOOGLE_API_KEY:
+        st.error("Missing GOOGLE_API_KEY in Secrets")
         st.stop()
 
-    # Visual status blocks (like “Searching Seek…” in your screenshot)
-    with st.status("🔎 Searching Google Jobs…", expanded=True) as status:
-        st.write(f"Client: **{client or '—'}**")
+    with st.status("🔎 Searching Seek via Google Jobs (SerpAPI)…", expanded=True) as status:
+        st.write(f"Client: **{client}**")
         st.write(f"Query: **{query}**")
 
-        # Pull pages of results (10 per page). You can tweak num_pages if you want a control here.
-        try:
-            raw_jobs = scrape_serp_jobs(query, location="New Zealand", num_pages=3)
-        except Exception as e:
-            st.error(f"Scrape failed: {e}")
-            st.stop()
+        raw_jobs = scrape_serp_jobs(query, location="New Zealand", num_pages=3)
+        seek_jobs = [j for j in raw_jobs if is_seek_link(j.get("Application Weblink", ""))]
 
-        st.write(f"Fetched **{len(raw_jobs)}** jobs from Google Jobs index.")
-        df_all = pd.DataFrame(raw_jobs)
-
-        # Apply board filters
-        df_filtered = filter_by_boards(df_all, cb1, cb2, cb3)
-
-        st.write("Applied board filters:",
-                 ("Seek " if cb1 else "") + ("TradeMe " if cb2 else "") + ("Indeed" if cb3 else ""))
+        st.write(f"Fetched {len(raw_jobs)} jobs; {len(seek_jobs)} are from Seek.")
         status.update(label="✨ Finished search", state="complete")
 
-    # ---------- Results ----------
-    if df_filtered.empty:
-        st.warning("No jobs matched the selected boards. Try widening the query or enabling more boards.")
+    df = pd.DataFrame(seek_jobs)
+    if df.empty:
+        st.warning("No Seek jobs found for this query.")
     else:
-        st.success(f"Found {len(df_filtered):,} matching jobs.")
-        # Nice column ordering when available
-        cols = [c for c in ["Source", "Position Title", "Company Name", "Location", "Posted", "Application Weblink"] if c in df_filtered.columns]
-        rest = [c for c in df_filtered.columns if c not in cols]
-        df_view = df_filtered[cols + rest]
-        st.dataframe(df_view, use_container_width=True)
+        st.success(f"Found {len(df):,} Seek jobs.")
+        st.dataframe(df, use_container_width=True)
 
-        # Download
         ts = datetime.now().strftime("%Y%m%d-%H%M")
-        base = normalize_filename(query)
-        fname = f"{base}_{ts}.csv"
-        st.download_button("⬇️ Download CSV", df_view.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=fname, mime="text/csv")
+        fname = f"{normalize_filename(client)}_{normalize_filename(query)}_{ts}_SEEK.csv"
+        st.download_button("⬇️ Download CSV",
+                           df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=fname,
+                           mime="text/csv")
 
-# Footer
 st.markdown("---")
-st.caption("Runs on Streamlit Community Cloud using SerpAPI (no browser needed).")
+st.caption("Client list comes from Airtable. Jobs from Google Jobs (Seek only).")
